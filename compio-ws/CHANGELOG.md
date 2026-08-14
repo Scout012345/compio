@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/compio-rs/compio/compare/compio-ws-v0.4.0...compio-ws-v0.4.1) - 2026-08-14
+
+### Other
+
+- *(deps)* update tungstenite requirement ([#975](https://github.com/compio-rs/compio/pull/975))
+
 ## 0.4.0 - 2026-05-27
 
 ### Added
