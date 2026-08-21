@@ -1,6 +1,6 @@
 [package]
 name = "compio-runtime"
-version = "0.12.1"
+version = "0.12.3"
 description = "High-level runtime for compio"
 categories = ["asynchronous"]
 keywords = ["async", "runtime"]
@@ -23,20 +23,25 @@ compio-io = { workspace = true, optional = true }
 
 criterion = { workspace = true, optional = true }
 compio-send-wrapper = { workspace = true }
-core_affinity = "0.8.3"
-futures-util = { workspace = true }
-scoped-tls = "1.0.1"
+futures-util = { workspace = true, features = ["io"] }
+scoped-tls = { workspace = true }
 pin-project-lite = { workspace = true }
+socket2 = { workspace = true }
 synchrony = { workspace = true, features = ["event"] }
 
 # Windows specific dependencies
 [target.'cfg(windows)'.dependencies]
 compio-io = { workspace = true, features = ["compat"] }
-windows-sys = { workspace = true, features = ["Win32_System_IO"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
 
 # Unix specific dependencies
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
@@ -51,6 +56,8 @@ synchrony = { workspace = true, features = ["async_flag"] }
 [features]
 time = []
 async-fd = ["dep:compio-io"]
+# Instrumentation for `tokio-console`. See the `console` module.
+console = ["compio-executor/console"]
 
 current_thread_id = []
 sanitize = []
@@ -66,4 +73,9 @@ name = "event"
 
 [[test]]
 name = "drop"
+required-features = ["time"]
+
+
+[[test]]
+name = "panic"
 required-features = ["time"]

@@ -1,12 +1,13 @@
 use std::{
     cell::RefCell,
+    io,
     marker::PhantomData,
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
 };
 
-use compio_buf::{BufResult, SetLen};
+use compio_buf::{BufResult, SetLenExt};
 use compio_driver::{
     BufferPool, BufferRef, Extra, Key, OpCode, Proactor, PushEntry, TakeBuffer,
     op::{RecvFromMultiResult, RecvMsgMultiResult},
@@ -14,7 +15,7 @@ use compio_driver::{
 use futures_util::{Stream, StreamExt, stream::FusedStream};
 
 use crate::{
-    ContextExt,
+    CancelToken, ContextExt,
     future::{poll_multishot, poll_task_with_extra, submit_raw},
 };
 
@@ -201,7 +202,7 @@ impl<T: OpCode, B: HandleBufferRef + 'static> SubmitMultiManaged<T, B> {
 impl<T: OpCode + TakeBuffer<Buffer = B> + 'static, B: HandleBufferRef> Stream
     for SubmitMultiManaged<T, B>
 {
-    type Item = std::io::Result<Option<B>>;
+    type Item = io::Result<Option<B>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(inner) = self.inner.as_mut() {
@@ -223,7 +224,7 @@ impl<T: OpCode + TakeBuffer<Buffer = B> + 'static, B: HandleBufferRef> Stream
                         let res = res?;
                         if let Some(mut b) = b {
                             unsafe {
-                                SetLen::advance_to(&mut b, res);
+                                SetLenExt::advance_to(&mut b, res);
                                 Some(B::from_buffer_ref(b, self.param))
                             }
                         } else {
@@ -281,7 +282,7 @@ impl HandleBufferRef for BufferRef {
     }
 
     unsafe fn advance_to(&mut self, len: usize) {
-        unsafe { SetLen::advance_to(self, len) }
+        unsafe { SetLenExt::advance_to(self, len) }
     }
 
     fn is_empty(&self) -> bool {
@@ -319,34 +320,60 @@ impl HandleBufferRef for RecvMsgMultiResult {
     }
 }
 
-/// A wrapper around [`SubmitMultiManaged`] that submits the operation
-/// automatically till the stream is finished.
-pub struct SubmitMultiStream<F, T: OpCode, B = BufferRef>
-where
-    B: HandleBufferRef + 'static,
-{
-    create_op: F,
-    op: Option<SubmitMultiManaged<T, B>>,
+/// Creates managed multishot submissions for [`SubmitMultiStream`].
+///
+/// [`SubmitMultiStream`] calls [`create`](Self::create) again when the previous
+/// submission ends before EOF.
+///
+/// By default, this trait is implemented for closures
+/// `FnMut() -> std::io::Result<SubmitMultiManaged<T, B>>`.
+pub trait SubmitMultiFactory {
+    /// The [`OpCode`] type.
+    type Op: OpCode + TakeBuffer<Buffer = Self::Buffer> + 'static;
+
+    /// The buffer returned by the OpCode.
+    ///
+    /// This can be [`BufferRef`], [`RecvFromMultiResult`] or
+    /// [`RecvMsgMultiResult`].
+    type Buffer: HandleBufferRef + 'static;
+
+    /// Creates a new managed multishot submission.
+    fn create(&mut self) -> io::Result<SubmitMultiManaged<Self::Op, Self::Buffer>>;
 }
 
-impl<F, T: OpCode, B: HandleBufferRef + 'static> SubmitMultiStream<F, T, B> {
-    /// Create a new [`SubmitMultiStream`] with a closure that creates the
-    /// operation.
-    pub fn new(create_op: F) -> Self {
-        Self {
-            create_op,
-            op: None,
-        }
+impl<F, T, B> SubmitMultiFactory for F
+where
+    F: FnMut() -> io::Result<SubmitMultiManaged<T, B>>,
+    T: OpCode + TakeBuffer<Buffer = B> + 'static,
+    B: HandleBufferRef + 'static,
+{
+    type Buffer = B;
+    type Op = T;
+
+    fn create(&mut self) -> io::Result<SubmitMultiManaged<Self::Op, Self::Buffer>> {
+        (self)()
     }
 }
 
-impl<
-    F: (Fn() -> std::io::Result<SubmitMultiManaged<T, B>>) + Unpin,
-    T: OpCode + TakeBuffer<Buffer = B> + 'static,
-    B: HandleBufferRef,
-> Stream for SubmitMultiStream<F, T, B>
+/// A wrapper around [`SubmitMultiManaged`] that submits operations
+/// automatically until the stream is finished.
+pub struct SubmitMultiStream<F: SubmitMultiFactory> {
+    factory: F,
+    op: Option<SubmitMultiManaged<F::Op, F::Buffer>>,
+}
+
+impl<F: SubmitMultiFactory> SubmitMultiStream<F> {
+    /// Creates a new [`SubmitMultiStream`] with `factory`.
+    pub fn new(factory: F) -> Self {
+        Self { factory, op: None }
+    }
+}
+
+impl<F> Stream for SubmitMultiStream<F>
+where
+    F: SubmitMultiFactory + Unpin,
 {
-    type Item = std::io::Result<B>;
+    type Item = io::Result<F::Buffer>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -363,7 +390,10 @@ impl<
                     Some(Err(e)) => break Poll::Ready(Some(Err(e))),
                     None => self.op = None,
                 },
-                None => match (self.create_op)() {
+                None if cx.get_cancel().is_some_and(CancelToken::is_cancelled) => {
+                    break Poll::Ready(None);
+                }
+                None => match self.factory.create() {
                     Ok(op) => self.op = Some(op),
                     Err(e) => break Poll::Ready(Some(Err(e))),
                 },

@@ -1,3 +1,5 @@
+#[cfg(feature = "read_buf")]
+use std::mem::MaybeUninit;
 use std::{
     cell::RefCell,
     fmt::Debug,
@@ -15,6 +17,7 @@ use compio_driver::{
     AsFd, AsRawFd, BorrowedFd, OpCode, OpType, RawFd, SharedFd, ToSharedFd, syscall,
 };
 use compio_io::compat::WakerArrayRef;
+use socket2::{SockRef, Socket};
 use synchrony::unsync::atomic::{AtomicI32, AtomicUsize};
 use windows_sys::Win32::{
     Networking::WinSock::{
@@ -56,6 +59,27 @@ impl<T: AsFd> PollFd<T> {
             write_waker: RefCell::new(None),
         })
     }
+}
+
+pub fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    run_socket_op(fd, |socket| io::Read::read(&mut &*socket, buf))
+}
+
+#[cfg(feature = "read_buf")]
+pub fn read_uninit(fd: BorrowedFd<'_>, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
+    run_socket_op(fd, |socket| socket.recv(buf))
+}
+
+pub fn readv(fd: BorrowedFd<'_>, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+    run_socket_op(fd, |socket| io::Read::read_vectored(&mut &*socket, bufs))
+}
+
+pub fn write(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<usize> {
+    run_socket_op(fd, |socket| socket.send(buf))
+}
+
+pub fn writev(fd: BorrowedFd<'_>, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    run_socket_op(fd, |socket| socket.send_vectored(bufs))
 }
 
 impl<T: AsFd + 'static> PollFd<T> {
@@ -210,14 +234,14 @@ impl WSAEvent {
     fn clear_event_inner(&self, event: i32) {
         let index = event.ilog2() as usize;
         if self.ev_record[index].fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.events.fetch_add(!event, Ordering::Relaxed);
+            self.events.fetch_and(!event, Ordering::Relaxed);
         }
     }
 
-    pub fn clear_event<T: AsFd>(&self, socket: &T, events: i32) -> io::Result<()> {
+    pub fn clear_event<T: AsFd>(&self, socket: &T, occurred: i32) -> io::Result<()> {
         for i in 0..FD_MAX_EVENTS {
             let event = 1 << i;
-            if (events & event) != 0 {
+            if (occurred & event) != 0 {
                 self.clear_event_inner(event);
             }
         }
@@ -226,7 +250,11 @@ impl WSAEvent {
             WSAEventSelect(
                 socket.as_fd().as_raw_fd() as _,
                 self.ev_object.as_raw_handle() as _,
-                events
+                // Re-register the interests that are still active. Passing the
+                // just-occurred events here would disable every other event,
+                // so a concurrent read/write on the same socket would never
+                // become ready again.
+                self.events.load(Ordering::Relaxed)
             )
         )?;
         Ok(())
@@ -280,5 +308,17 @@ impl<T: AsFd> IntoInner for WaitWSAEvent<T> {
 
     fn into_inner(self) -> Self::Inner {
         self.events
+    }
+}
+
+pub fn run_socket_op<R>(
+    fd: BorrowedFd<'_>,
+    f: impl FnOnce(&Socket) -> io::Result<R>,
+) -> io::Result<R> {
+    use windows_sys::Win32::Networking::WinSock::WSAENOTSOCK;
+
+    match fd {
+        BorrowedFd::File(_) => Err(io::Error::from_raw_os_error(WSAENOTSOCK)),
+        BorrowedFd::Socket(socket) => f(&SockRef::from(&socket)),
     }
 }
